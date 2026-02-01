@@ -152,57 +152,77 @@ class CastPreloader(xbmc.Monitor):
     def _format_actor_bio(self, actor_name, person_details):
         """
         Formata a biografia de um ator no formato especificado.
-        Exemplo: [B]Walter Scobel[/B] possui 17 anos, nasceu em 06/01/2009 em Los Angeles, California, USA.
+        Exemplo vivo: [B]Walter Scobel[/B] possui 17 anos, nasceu em 06/01/2009 em Los Angeles, California, USA.
+        Exemplo morto: [B]Robin Williams[/B] faleceu em 11/08/2014 aos 63 anos, nasceu em 21/07/1951 em Chicago, Illinois, USA.
         """
         if not person_details:
             return None
         
-        age = self._calculate_age(
-            person_details.get('birthday'),
-            person_details.get('deathday')
-        )
-        birthday_formatted = self._format_date_br(person_details.get('birthday'))
-        place_of_birth = person_details.get('place_of_birth', '').strip() if person_details.get('place_of_birth') else None
-        is_dead = person_details.get('deathday') is not None
+        # Obtém os dados
+        birthday_raw = person_details.get('birthday')
+        deathday_raw = person_details.get('deathday')
+        place_of_birth_raw = person_details.get('place_of_birth')
         
-        # Construir a frase
-        parts = []
+        # Calcula idade corretamente
+        age = self._calculate_age(birthday_raw, deathday_raw)
+        birthday_formatted = self._format_date_br(birthday_raw)
+        deathday_formatted = self._format_date_br(deathday_raw)
+        place_of_birth = place_of_birth_raw.strip() if place_of_birth_raw else None
+        is_dead = deathday_raw is not None and deathday_raw != ''
         
         # Nome em negrito
         name_part = "[B]%s[/B]" % actor_name
         
-        # Construir resto da frase
-        if age is not None and birthday_formatted and place_of_birth:
-            if is_dead:
-                bio = "%s tinha %d anos quando faleceu, nasceu em %s em %s." % (name_part, age, birthday_formatted, place_of_birth)
-            else:
-                bio = "%s possui %d anos, nasceu em %s em %s." % (name_part, age, birthday_formatted, place_of_birth)
-        elif age is not None and birthday_formatted:
-            if is_dead:
-                bio = "%s tinha %d anos quando faleceu, nasceu em %s." % (name_part, age, birthday_formatted)
-            else:
-                bio = "%s possui %d anos, nasceu em %s." % (name_part, age, birthday_formatted)
-        elif age is not None and place_of_birth:
-            if is_dead:
+        # ============================================================
+        # PESSOA FALECIDA
+        # ============================================================
+        if is_dead:
+            if age is not None and deathday_formatted and birthday_formatted and place_of_birth:
+                bio = "%s faleceu em %s aos %d anos, nasceu em %s em %s." % (name_part, deathday_formatted, age, birthday_formatted, place_of_birth)
+            elif age is not None and deathday_formatted and birthday_formatted:
+                bio = "%s faleceu em %s aos %d anos, nasceu em %s." % (name_part, deathday_formatted, age, birthday_formatted)
+            elif age is not None and deathday_formatted and place_of_birth:
+                bio = "%s faleceu em %s aos %d anos, nasceu em %s." % (name_part, deathday_formatted, age, place_of_birth)
+            elif age is not None and deathday_formatted:
+                bio = "%s faleceu em %s aos %d anos." % (name_part, deathday_formatted, age)
+            elif deathday_formatted and birthday_formatted and place_of_birth:
+                bio = "%s faleceu em %s, nasceu em %s em %s." % (name_part, deathday_formatted, birthday_formatted, place_of_birth)
+            elif deathday_formatted and birthday_formatted:
+                bio = "%s faleceu em %s, nasceu em %s." % (name_part, deathday_formatted, birthday_formatted)
+            elif deathday_formatted and place_of_birth:
+                bio = "%s faleceu em %s, nasceu em %s." % (name_part, deathday_formatted, place_of_birth)
+            elif deathday_formatted:
+                bio = "%s faleceu em %s." % (name_part, deathday_formatted)
+            elif age is not None and place_of_birth:
                 bio = "%s tinha %d anos quando faleceu, nasceu em %s." % (name_part, age, place_of_birth)
-            else:
-                bio = "%s possui %d anos, nasceu em %s." % (name_part, age, place_of_birth)
-        elif age is not None:
-            if is_dead:
+            elif age is not None:
                 bio = "%s tinha %d anos quando faleceu." % (name_part, age)
             else:
-                bio = "%s possui %d anos." % (name_part, age)
-        elif birthday_formatted and place_of_birth:
-            bio = "%s nasceu em %s em %s." % (name_part, birthday_formatted, place_of_birth)
-        elif birthday_formatted:
-            bio = "%s nasceu em %s." % (name_part, birthday_formatted)
-        elif place_of_birth:
-            bio = "%s nasceu em %s." % (name_part, place_of_birth)
-        else:
-            return None  # Sem dados suficientes
+                return None
         
-        return bio
-
+        # ============================================================
+        # PESSOA VIVA
+        # ============================================================
+        else:
+            if age is not None and birthday_formatted and place_of_birth:
+                bio = "%s possui %d anos, nasceu em %s em %s." % (name_part, age, birthday_formatted, place_of_birth)
+            elif age is not None and birthday_formatted:
+                bio = "%s possui %d anos, nasceu em %s." % (name_part, age, birthday_formatted)
+            elif age is not None and place_of_birth:
+                bio = "%s possui %d anos, nasceu em %s." % (name_part, age, place_of_birth)
+            elif age is not None:
+                bio = "%s possui %d anos." % (name_part, age)
+            elif birthday_formatted and place_of_birth:
+                bio = "%s nasceu em %s em %s." % (name_part, birthday_formatted, place_of_birth)
+            elif birthday_formatted:
+                bio = "%s nasceu em %s." % (name_part, birthday_formatted)
+            elif place_of_birth:
+                bio = "%s nasceu em %s." % (name_part, place_of_birth)
+            else:
+                return None  # Sem dados suficientes
+        
+        return bio   
+    
     def _get_movie_cast_from_tmdb(self, tmdb_id, media_type):
         """
         Obtém o cast do filme/série do TMDB.
@@ -344,8 +364,8 @@ class CastPreloader(xbmc.Monitor):
                 self._trigger_instant_preload()
             
             elif method == 'Player.OnPlay':
-                # Quando inicia playback, prepara biografias em background
-                xbmc.log('[%s] ⚡ Player.OnPlay - Preparing cast bios' % ADDON_ID, xbmc.LOGINFO)
+                # Quando inicia playback, prepara TUDO em background
+                xbmc.log('[%s] ⚡ Player.OnPlay - Preparing ALL data (cast + metadata + bios)' % ADDON_ID, xbmc.LOGINFO)
                 self._last_bios_update_id = None  # Reset para forçar nova busca
                 
         except Exception as e:
@@ -469,7 +489,7 @@ class CastPreloader(xbmc.Monitor):
             
             if cast_data:
                 CastPreloader._cast_cache_memory[cache_key] = cast_data
-                xbmc.log('[%s] ✓ Cached: %s (%.2fs)' % 
+                xbmc.log('[%s] ��� Cached: %s (%.2fs)' % 
                          (ADDON_ID, cache_key, time.time() - start_time), xbmc.LOGINFO)
 
         except Exception as e:
@@ -666,7 +686,7 @@ class CastPreloader(xbmc.Monitor):
         last_playerid = None
         last_preloaded_playing = None
 
-        xbmc.log('[%s] 🚀 Adaptive loop started (with instant transitions + cast bios)' % ADDON_ID, xbmc.LOGINFO)
+        xbmc.log('[%s] 🚀 Adaptive loop started (with instant transitions + cast bios + preload ALL on play)' % ADDON_ID, xbmc.LOGINFO)
 
         while not self.abortRequested():
             interval, context = self._get_adaptive_interval()
@@ -676,7 +696,10 @@ class CastPreloader(xbmc.Monitor):
              
             is_playing = xbmc.getCondVisibility('Player.HasVideo')
             
-            # Captura info do item em reprodução (para transição instantânea)
+            # ============================================================
+            # PR��-CARREGA TUDO ASSIM QUE O VÍDEO COMEÇA
+            # Cast + Metadata + Biografias - tudo em background
+            # ============================================================
             if is_playing:
                 try:
                     p_tmdb = xbmc.getInfoLabel('VideoPlayer.UniqueID(tmdb)')
@@ -701,10 +724,16 @@ class CastPreloader(xbmc.Monitor):
                     if current_playing_id != last_preloaded_playing and (p_tmdb or p_imdb):
                         last_preloaded_playing = current_playing_id
                         
-                        xbmc.log('[%s] 🎬 Preloading playing item: %s' % 
+                        xbmc.log('[%s] 🎬 Preloading ALL data for playing item: %s' % 
                                  (ADDON_ID, current_playing_id), xbmc.LOGINFO)
                         
-                        Thread(target=self.preload_cast, args=(p_tmdb, p_media_type, p_imdb)).start()
+                        # PRÉ-CARREGA TUDO EM BACKGROUND (Cast + Metadata + Bios)
+                        def _preload_all_playing_data(t_id, i_id, m_type):
+                            self.preload_cast(t_id, m_type, i_id)
+                            self.fetch_and_set_metadata(t_id, i_id, m_type)
+                            self._update_cast_bios_property(t_id, m_type)
+                        
+                        Thread(target=_preload_all_playing_data, args=(p_tmdb, p_imdb, p_media_type)).start()
                 except:
                     pass
              
@@ -737,7 +766,7 @@ class CastPreloader(xbmc.Monitor):
                 except: pass
 
             # ============================================================
-            # OSD/SeekBar - ATUALIZADO PARA INCLUIR BIOGRAFIAS
+            # OSD/SeekBar - FALLBACK (dados já devem estar prontos)
             # ============================================================
             if is_playing and (xbmc.getCondVisibility('Window.IsActive(videoosd)') or 
                                xbmc.getCondVisibility('Window.IsActive(seekbardialog)') or
@@ -747,32 +776,25 @@ class CastPreloader(xbmc.Monitor):
                     p_tmdb = xbmc.getInfoLabel('VideoPlayer.UniqueID(tmdb)')
                     if not p_tmdb:
                         p_tmdb = xbmc.getInfoLabel('VideoPlayer.UniqueID')
-
                     p_imdb = xbmc.getInfoLabel('VideoPlayer.IMDBNumber')
                     
                     p_media_type = 'movie'
                     if xbmc.getCondVisibility('VideoPlayer.Content(episodes)'):
                         p_media_type = 'tv'
                     
-                    current_playerid = '%s_%s' % (p_media_type, p_tmdb)
+                    # FALLBACK: Se por algum motivo não tiver dados, busca agora
+                    win = xbmcgui.Window(10000)
                     
-                    if current_playerid != last_playerid and p_tmdb:
-                        last_playerid = current_playerid
-                        
-                        # Busca metadata E biografias em paralelo
-                        def _osd_worker(t_id, i_id, m_type):
-                            self.fetch_and_set_metadata(t_id, i_id, m_type)
-                            self._update_cast_bios_property(t_id, m_type)
-                        
-                        Thread(target=_osd_worker, args=(p_tmdb, p_imdb, p_media_type)).start()
+                    if not win.getProperty('ds_cast_bios') and p_tmdb:
+                        xbmc.log('[%s] ⚠️ OSD opened but bios missing - fetching now' % ADDON_ID, xbmc.LOGWARNING)
+                        Thread(target=self._update_cast_bios_property, args=(p_tmdb, p_media_type)).start()
                     
-                    # Verifica se precisamos atualizar bios (mesmo que já tenhamos metadata)
-                    elif p_tmdb:
-                        win = xbmcgui.Window(10000)
-                        if not win.getProperty('ds_cast_bios'):
-                            Thread(target=self._update_cast_bios_property, args=(p_tmdb, p_media_type)).start()
+                    if not win.getProperty('budget') and not win.getProperty('mpaa') and p_tmdb:
+                        xbmc.log('[%s] ⚠️ OSD opened but metadata missing - fetching now' % ADDON_ID, xbmc.LOGWARNING)
+                        Thread(target=self.fetch_and_set_metadata, args=(p_tmdb, p_imdb, p_media_type)).start()
                             
-                except: pass
+                except: 
+                    pass
 
             self.check_focused_item()
               
