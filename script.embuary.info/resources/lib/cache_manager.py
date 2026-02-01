@@ -16,8 +16,8 @@ from queue import Queue
 
 ADDON_DATA_PATH = xbmcvfs.translatePath('special://profile/addon_data/script.embuary.info/')
 DB_PATH = os.path.join(ADDON_DATA_PATH, 'cast_cache.db')
-CACHE_TTL_CAST = 7 * 24 * 60 * 60  # 7 dias em segundos
-CACHE_TTL_IMDB_MAP = 30 * 24 * 60 * 60  # 30 dias (conversão IMDB→TMDB raramente muda)
+CACHE_TTL_CAST = 90 * 24 * 60 * 60  # 90 dias
+CACHE_TTL_IMDB_MAP = 90 * 24 * 60 * 60  # 90 dias
 
 ########################
 

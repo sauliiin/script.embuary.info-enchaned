@@ -269,8 +269,33 @@ class CastPreloader(xbmc.Monitor):
     def fetch_and_set_metadata(self, tmdb_id, imdb_id, media_type):
         """Busca metadata e define via SetProperty - DIFERENCIA FILME DE SÉRIE"""
         try:
+            # 1. Verifica Cache Primeiro (Meta Cache)
+            meta_cache_key = 'meta_%s_%s' % (media_type, tmdb_id)
+            cached_meta = self.cache_manager.get(meta_cache_key)
+            
+            if cached_meta:
+                xbmc.log('[%s] ✓ Metadata cache HIT: %s' % (ADDON_ID, meta_cache_key), xbmc.LOGDEBUG)
+                for key, value in cached_meta.items():
+                    if value:
+                        xbmc.executebuiltin('SetProperty(%s,"%s",home)' % (key, value))
+                    else:
+                        xbmc.executebuiltin('ClearProperty(%s,home)' % key)
+                return
+
+            # 2. Cache MISS - Busca da API
+            xbmc.log('[%s] ✗ Metadata cache MISS: %s - Fetching...' % (ADDON_ID, meta_cache_key), xbmc.LOGDEBUG)
+            
             from resources.lib.tmdb import tmdb_query, tmdb_get_cert, format_currency
             from resources.lib.omdb import omdb_api
+            
+            meta_dict = {
+                'budget': '',
+                'revenue': '',
+                'mpaa': '',
+                'studio': '',
+                'country': '',
+                'awards': ''
+            }
             
             if tmdb_id:
                 # ============================================================
@@ -286,44 +311,32 @@ class CastPreloader(xbmc.Monitor):
                     
                     if tv_data:
                         # Séries NÃO têm budget/revenue
-                        xbmc.executebuiltin('ClearProperty(budget,home)')
-                        xbmc.executebuiltin('ClearProperty(revenue,home)')
+                        meta_dict['budget'] = ''
+                        meta_dict['revenue'] = ''
                         
                         # MPAA para séries usa content_ratings
-                        mpaa_val = tmdb_get_cert(tv_data)
-                        if mpaa_val:
-                            xbmc.executebuiltin('SetProperty(mpaa,"%s",home)' % mpaa_val)
-                        else:
-                            xbmc.executebuiltin('ClearProperty(mpaa,home)')
+                        meta_dict['mpaa'] = tmdb_get_cert(tv_data) or ''
                         
                         # Séries usam 'networks' como studio principal
                         networks = tv_data.get('networks', [])
                         if networks:
                             network_str = ', '.join([n['name'] for n in networks])
-                            network_str = network_str.replace('"', "'")
-                            xbmc.executebuiltin('SetProperty(studio,"%s",home)' % network_str)
+                            meta_dict['studio'] = network_str.replace('"', "'")
                         else:
                             studios = tv_data.get('production_companies', [])
                             if studios:
                                 studio_str = ', '.join([s['name'] for s in studios])
-                                studio_str = studio_str.replace('"', "'")
-                                xbmc.executebuiltin('SetProperty(studio,"%s",home)' % studio_str)
-                            else:
-                                xbmc.executebuiltin('ClearProperty(studio,home)')
+                                meta_dict['studio'] = studio_str.replace('"', "'")
                         
                         # Countries (origin_country para séries)
                         countries = tv_data.get('origin_country', [])
                         if countries:
-                            country_str = ', '.join(countries)
-                            xbmc.executebuiltin('SetProperty(country,"%s",home)' % country_str)
+                            meta_dict['country'] = ', '.join(countries)
                         else:
                             prod_countries = tv_data.get('production_countries', [])
                             if prod_countries:
                                 country_str = ', '.join([c['name'] for c in prod_countries])
-                                country_str = country_str.replace('"', "'")
-                                xbmc.executebuiltin('SetProperty(country,"%s",home)' % country_str)
-                            else:
-                                xbmc.executebuiltin('ClearProperty(country,home)')
+                                meta_dict['country'] = country_str.replace('"', "'")
                         
                         # Atualiza IMDB ID se não tiver
                         if not imdb_id:
@@ -343,40 +356,22 @@ class CastPreloader(xbmc.Monitor):
                     if movie_data:
                         budget_val = format_currency(movie_data.get('budget'))
                         revenue_val = format_currency(movie_data.get('revenue'))
-                        mpaa_val = tmdb_get_cert(movie_data)
                         
-                        if budget_val: 
-                            xbmc.executebuiltin('SetProperty(budget,"%s",home)' % budget_val)
-                        else:
-                            xbmc.executebuiltin('ClearProperty(budget,home)')
-                            
-                        if revenue_val: 
-                            xbmc.executebuiltin('SetProperty(revenue,"%s",home)' % revenue_val)
-                        else:
-                            xbmc.executebuiltin('ClearProperty(revenue,home)')
-                            
-                        if mpaa_val: 
-                            xbmc.executebuiltin('SetProperty(mpaa,"%s",home)' % mpaa_val)
-                        else:
-                            xbmc.executebuiltin('ClearProperty(mpaa,home)')
+                        meta_dict['budget'] = budget_val if budget_val else ''
+                        meta_dict['revenue'] = revenue_val if revenue_val else ''
+                        meta_dict['mpaa'] = tmdb_get_cert(movie_data) or ''
                         
                         # Studios (production_companies para filmes)
                         studios = movie_data.get('production_companies', [])
                         if studios:
                             studio_str = ', '.join([s['name'] for s in studios])
-                            studio_str = studio_str.replace('"', "'")
-                            xbmc.executebuiltin('SetProperty(studio,"%s",home)' % studio_str)
-                        else:
-                            xbmc.executebuiltin('ClearProperty(studio,home)')
+                            meta_dict['studio'] = studio_str.replace('"', "'")
 
                         # Countries
                         countries = movie_data.get('production_countries', [])
                         if countries:
                             country_str = ', '.join([c['name'] for c in countries])
-                            country_str = country_str.replace('"', "'")
-                            xbmc.executebuiltin('SetProperty(country,"%s",home)' % country_str)
-                        else:
-                            xbmc.executebuiltin('ClearProperty(country,home)')
+                            meta_dict['country'] = country_str.replace('"', "'")
                         
                         # Atualiza IMDB ID se não tiver
                         if not imdb_id:
@@ -389,14 +384,20 @@ class CastPreloader(xbmc.Monitor):
                 try:
                     omdb_data = omdb_api(imdb_id)
                     if omdb_data and omdb_data.get('awards'):
-                        awards = omdb_data['awards'].replace('"', "'")
-                        xbmc.executebuiltin('SetProperty(awards,"%s",home)' % awards)
-                    else:
-                        xbmc.executebuiltin('ClearProperty(awards,home)')
+                        meta_dict['awards'] = omdb_data['awards'].replace('"', "'")
                 except:
-                    xbmc.executebuiltin('ClearProperty(awards,home)')
-            else:
-                xbmc.executebuiltin('ClearProperty(awards,home)')
+                    pass
+            
+            # 3. Salva no Cache
+            self.cache_manager.set(meta_cache_key, meta_dict)
+            xbmc.log('[%s] 💾 Metadata cached: %s' % (ADDON_ID, meta_cache_key), xbmc.LOGINFO)
+            
+            # 4. Aplica Propriedades
+            for key, value in meta_dict.items():
+                if value:
+                    xbmc.executebuiltin('SetProperty(%s,"%s",home)' % (key, value))
+                else:
+                    xbmc.executebuiltin('ClearProperty(%s,home)' % key)
 
         except Exception as e:
             xbmc.log('[%s] Metadata Fetch Error: %s' % (ADDON_ID, str(e)), xbmc.LOGWARNING)
