@@ -4,10 +4,7 @@
 import xbmc
 import xbmcaddon
 import xbmcgui
-import json
 import time
-import sqlite3
-import datetime
 from datetime import date
 from threading import Thread, Lock
 
@@ -15,23 +12,21 @@ ADDON = xbmcaddon.Addon()
 ADDON_ID = ADDON.getAddonInfo('id')
 
 # ============================================================
-# Cache para biografias dos atores
+# Caches em MEMÓRIA (acesso instantâneo)
 # ============================================================
 _cast_bios_cache = {}
 _cast_bios_lock = Lock()
-BIOS_CACHE_MAX_AGE = 86400 * 30  # 30 dias
-
+_generated_bios_text_cache = {}
+_generated_bios_lock = Lock()
+_imdb_tmdb_memory_cache = {}
+_imdb_tmdb_lock = Lock()
+BIOS_CACHE_MAX_AGE = 86400 * 30
 
 class CastPreloader(xbmc.Monitor):
-    # ============================================================
-    # Referências permanentes em nível de classe
-    # ============================================================
-    _pinned_modules = {}
     _cast_cache_memory = {}
+    _processing_keys = set()
+    _processing_lock = Lock()
     
-    # ============================================================
-    # Configurações de frequência adaptativa
-    # ============================================================
     INTERVAL_FAST = 0.3
     INTERVAL_NORMAL = 0.5
     INTERVAL_SLOW = 2.0
@@ -40,202 +35,316 @@ class CastPreloader(xbmc.Monitor):
     def __init__(self):
         super(CastPreloader, self).__init__()
         self.current_item = None
-        self.processing = False
-        self.lock = Lock()
-        
-        self._info_history = {}
-        self._player_preloaded = set()
-        
-        self._current_interval = self.INTERVAL_NORMAL
-        self._last_activity_time = time.time()
         self._last_context = 'unknown'
-        
-        # Cache do item em reprodução para transição instantânea
         self._playing_item_cache = {}
-        self._force_fast_interval = False
-        self._fast_interval_until = 0
-        
-        # Flag para controlar atualização de biografias
         self._last_bios_update_id = None
         self._bios_updating = False
+        self._warmup_complete = False
         
+        # Imports LEVES apenas - necessários para cast
         from resources.lib.cache_manager import get_cache_manager
         from resources.lib.async_loader import get_async_loader
-
-        try:
-            from resources.lib.video import TMDBVideos
-            from resources.lib.tmdb import tmdb_query
-            
-            CastPreloader._pinned_modules = {
-                'sqlite3': sqlite3,
-                'json': json,
-                'datetime': datetime,
-                'time': time,
-                'TMDBVideos': TMDBVideos,
-                'tmdb_query': tmdb_query,
-            }
-            
-            xbmc.log('[%s] ✓ Permanent references pinned (%d modules)' % 
-                     (ADDON_ID, len(CastPreloader._pinned_modules)), xbmc.LOGINFO)
-        except Exception as e:
-            xbmc.log('[%s] ✗ Warm-up error: %s' % (ADDON_ID, str(e)), xbmc.LOGWARNING)
         
         self.cache_manager = get_cache_manager()
         self.async_loader = get_async_loader()
         
-        CastPreloader._pinned_modules['cache_manager'] = self.cache_manager
-        CastPreloader._pinned_modules['async_loader'] = self.async_loader
-        
-        xbmc.log('[%s] ✓ Cast Preloader Service Started (Adaptive + Instant Transition + Cast Bios)' % ADDON_ID, xbmc.LOGINFO)
+        xbmc.log('[%s] Cast Preloader Initialized' % ADDON_ID, xbmc.LOGINFO)
 
     # ============================================================
-    # Funções auxiliares para biografias
+    # WARM-UP: Service cache + Plugin libraries
+    # ============================================================
+    def _warmup_cache_on_startup(self):
+        try:
+            start = time.time()
+            
+            # 1. Warm-up do cache (dados)
+            recent_cast = self.cache_manager.get_recent_items('cast_', limit=1)
+            if recent_cast:
+                CastPreloader._cast_cache_memory.update(recent_cast)
+            
+            self._warmup_complete = True
+            xbmc.log('[%s] Service Warm-up: %.2fs (cast:%d)' % 
+                     (ADDON_ID, time.time() - start, len(recent_cast or {})), xbmc.LOGINFO)
+                     
+        except Exception as e:
+            xbmc.log('[%s] Service Warm-up error: %s' % (ADDON_ID, e), xbmc.LOGWARNING)
+            self._warmup_complete = True
+
+    def _warmup_plugin_on_startup(self):
+        """Aciona warm-up do plugin para pré-carregar bibliotecas pesadas"""
+        try:
+            xbmc.log('[%s] Triggering Plugin Warm-up...' % ADDON_ID, xbmc.LOGINFO)
+            
+            # Aguarda um pouco para não sobrecarregar o startup
+            xbmc.sleep(1000)  # 1 segundo
+            
+            # Chama o plugin em modo warmup (não bloqueia, retorna rápido)
+            xbmc.executebuiltin('RunScript(script.embuary.info,mode=warmup)', wait=False)
+            
+            xbmc.log('[%s] Plugin Warm-up triggered' % ADDON_ID, xbmc.LOGINFO)
+        except Exception as e:
+            xbmc.log('[%s] Plugin Warm-up trigger failed: %s' % (ADDON_ID, e), xbmc.LOGWARNING)
+
+    # ============================================================
+    # CAST - RÁPIDO E SEM BLOQUEIO
+    # ============================================================
+    def preload_cast(self, tmdb_id, media_type, imdb_id=None):
+        try:
+            # Resolve TMDB ID se necessário
+            if (not tmdb_id or tmdb_id in ['None', '']) and imdb_id:
+                tmdb_id, media_type = self._resolve_tmdb_id(imdb_id, media_type)
+            
+            if not tmdb_id or tmdb_id == 'None':
+                return None
+
+            cache_key = 'cast_%s_%s' % (media_type, tmdb_id)
+            
+            # 1. CACHE HIT - Retorna instantâneo
+            if cache_key in CastPreloader._cast_cache_memory:
+                return CastPreloader._cast_cache_memory[cache_key]
+            
+            # 2. Verifica se já está sendo processado
+            with self._processing_lock:
+                if cache_key in self._processing_keys:
+                    return None
+                self._processing_keys.add(cache_key)
+            
+            try:
+                # 3. CACHE MISS - Busca
+                cast_data = self.async_loader.get_cast_from_cache_or_load(
+                    tmdb_id, media_type, self.cache_manager
+                )
+                
+                if cast_data:
+                    CastPreloader._cast_cache_memory[cache_key] = cast_data
+                    return cast_data
+                    
+            finally:
+                with self._processing_lock:
+                    self._processing_keys.discard(cache_key)
+                    
+        except Exception as e:
+            xbmc.log('[%s] Cast error: %s' % (ADDON_ID, e), xbmc.LOGERROR)
+        
+        return None
+
+    # ============================================================
+    # NOVO MÉTODO: Popula Window Properties para XML
+    # ============================================================
+    def populate_cast_properties(self, tmdb_id, media_type, imdb_id=None, window_id=10000):
+        """Popula Window Properties com cast para uso direto no XML"""
+        try:
+            win = xbmcgui.Window(window_id)
+
+            # Limpa properties antigas
+            for i in range(10):
+                win.clearProperty('Cast.%d.Name' % i)
+                win.clearProperty('Cast.%d.Role' % i)
+                win.clearProperty('Cast.%d.Thumb' % i)
+                win.clearProperty('Cast.%d.ID' % i)
+            win.clearProperty('Cast.Count')
+
+            # Resolve TMDB ID se necessário
+            if (not tmdb_id or tmdb_id in ['None', '']) and imdb_id:
+                tmdb_id, media_type = self._resolve_tmdb_id(imdb_id, media_type)
+
+            if not tmdb_id or tmdb_id == 'None':
+                return
+
+            # Tenta cache primeiro
+            cache_key = 'cast_%s_%s' % (media_type, tmdb_id)
+            cast_data = CastPreloader._cast_cache_memory.get(cache_key)
+
+            if not cast_data:
+                cast_data = self.async_loader.get_cast_from_cache_or_load(
+                    tmdb_id, media_type, self.cache_manager
+                )
+                if cast_data:
+                    CastPreloader._cast_cache_memory[cache_key] = cast_data
+
+            # Fallback: busca direto do TMDB
+                if not cast_data:
+                    # Usa helper atualizado que retorna profile_path
+                    cast_data = self._get_movie_cast_from_tmdb(tmdb_id, media_type)
+
+            # Popula properties
+            count = 0
+            
+            if isinstance(cast_data, list):
+                for i, actor in enumerate(cast_data[:10]):
+                    if isinstance(actor, dict):
+                        name = actor.get('name', '')
+                        
+                        # ★★★ CORREÇÃO: Verifica 'thumb' E 'profile_path' ★★★
+                        thumb = actor.get('thumb', '')
+                        if not thumb:
+                            profile_path = actor.get('profile_path', '')
+                            if profile_path:
+                                thumb = 'https://image.tmdb.org/t/p/w185%s' % profile_path
+                        
+                        role = actor.get('role', '') or actor.get('character', '')
+                        
+                        win.setProperty('Cast.%d.Name' % i, name)
+                        win.setProperty('Cast.%d.Role' % i, role)
+                        win.setProperty('Cast.%d.Thumb' % i, thumb)
+                        win.setProperty('Cast.%d.ID' % i, str(actor.get('id', '')))
+                        
+                        
+                        count += 1
+
+            win.setProperty('Cast.Count', str(count))
+            
+
+        except Exception as e:
+            xbmc.log('[%s] Error populating cast properties: %s' % (ADDON_ID, e), xbmc.LOGERROR)
+            import traceback
+            xbmc.log('[%s] Traceback: %s' % (ADDON_ID, traceback.format_exc()), xbmc.LOGERROR)
+
+    def _resolve_tmdb_id(self, imdb_id, media_type):
+        # 1. Cache memória
+        with _imdb_tmdb_lock:
+            if imdb_id in _imdb_tmdb_memory_cache:
+                cached = _imdb_tmdb_memory_cache[imdb_id]
+                return cached.get('tmdb_id'), cached.get('media_type', media_type)
+        
+        # 2. Cache disco
+        cached_tmdb_id, cached_media_type = self.cache_manager.get_tmdb_from_imdb(imdb_id)
+        if cached_tmdb_id:
+            with _imdb_tmdb_lock:
+                _imdb_tmdb_memory_cache[imdb_id] = {'tmdb_id': cached_tmdb_id, 'media_type': cached_media_type}
+            return cached_tmdb_id, cached_media_type or media_type
+        
+        # 3. API (import tardio)
+        try:
+            from resources.lib.tmdb import tmdb_query
+            find_data = tmdb_query(
+                action='find', 
+                call=imdb_id, 
+                params={'external_source': 'imdb_id'}, 
+                show_error=False
+            )
+            results_key = 'movie_results' if media_type == 'movie' else 'tv_results'
+            if find_data and results_key in find_data and find_data[results_key]:
+                tmdb_id = find_data[results_key][0]['id']
+                self.cache_manager.set_imdb_tmdb_map(imdb_id, tmdb_id, media_type)
+                with _imdb_tmdb_lock:
+                    _imdb_tmdb_memory_cache[imdb_id] = {'tmdb_id': tmdb_id, 'media_type': media_type}
+                return tmdb_id, media_type
+        except:
+            pass
+        
+        return None, media_type
+
+    # ============================================================
+    # Biografias (imports tardios)
     # ============================================================
     def _calculate_age(self, birthday_str, deathday_str=None):
-        """Calcula a idade baseada na data de nascimento."""
         if not birthday_str:
             return None
         try:
-            birth_date = datetime.datetime.strptime(birthday_str, "%Y-%m-%d").date()
-            if deathday_str:
-                end_date = datetime.datetime.strptime(deathday_str, "%Y-%m-%d").date()
-            else:
-                end_date = date.today()
-            
-            age = end_date.year - birth_date.year
-            if (end_date.month, end_date.day) < (birth_date.month, birth_date.day):
+            import datetime
+            birth = datetime.datetime.strptime(birthday_str, "%Y-%m-%d").date()
+            end = datetime.datetime.strptime(deathday_str, "%Y-%m-%d").date() if deathday_str else date.today()
+            age = end.year - birth.year
+            if (end.month, end.day) < (birth.month, birth.day):
                 age -= 1
             return age
         except:
             return None
 
     def _format_date_br(self, date_str):
-        """Formata data para formato brasileiro DD/MM/YYYY."""
         if not date_str:
             return None
         try:
-            dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-            return dt.strftime("%d/%m/%Y")
+            import datetime
+            return datetime.datetime.strptime(date_str, "%Y-%m-%d").strftime("%d/%m/%Y")
         except:
             return None
 
-    def _get_person_details(self, person_id):
-        """Busca detalhes de uma pessoa do TMDB com cache."""
+    def _get_person_details_cached(self, person_id):
         cache_key = 'person_bio_%s' % person_id
         
+        # Cache memória
         with _cast_bios_lock:
             if cache_key in _cast_bios_cache:
                 cached = _cast_bios_cache[cache_key]
                 if time.time() - cached['ts'] < BIOS_CACHE_MAX_AGE:
-                    return cached['data']
+                    return cached['data'], True
         
+        # API (import tardio)
         try:
             from resources.lib.tmdb import tmdb_query
-            details = tmdb_query(
-                action='person',
-                call=str(person_id),
-                params={'language': 'pt-BR'},
-                show_error=False
-            )
+            details = None
+            
+            for attempt in range(3):
+                details = tmdb_query(
+                    action='person',
+                    call=str(person_id),
+                    params={'language': 'pt-BR'},
+                    show_error=False
+                )
+                if details:
+                    break
+                time.sleep(0.5)
             
             if details:
                 with _cast_bios_lock:
-                    _cast_bios_cache[cache_key] = {
-                        'data': details,
-                        'ts': time.time()
-                    }
-            return details
-        except Exception as e:
-            xbmc.log('[%s] Error fetching person %s: %s' % (ADDON_ID, person_id, e), xbmc.LOGWARNING)
-            return None
+                    _cast_bios_cache[cache_key] = {'data': details, 'ts': time.time()}
+                try:
+                    self.cache_manager.set(cache_key, details)
+                except:
+                    pass
+                return details, False
+            return None, False
+        except:
+            return None, False
 
     def _format_actor_bio(self, actor_name, person_details):
-        """
-        Formata a biografia de um ator no formato especificado.
-        Exemplo vivo: [B]Walter Scobel[/B] possui 17 anos, nasceu em 06/01/2009 em Los Angeles, California, USA.
-        Exemplo morto: [B]Robin Williams[/B] faleceu em 11/08/2014 aos 63 anos, nasceu em 21/07/1951 em Chicago, Illinois, USA.
-        """
         if not person_details:
             return None
         
-        # Obtém os dados
         birthday_raw = person_details.get('birthday')
         deathday_raw = person_details.get('deathday')
         place_of_birth_raw = person_details.get('place_of_birth')
         
-        # Calcula idade corretamente
         age = self._calculate_age(birthday_raw, deathday_raw)
         birthday_formatted = self._format_date_br(birthday_raw)
         deathday_formatted = self._format_date_br(deathday_raw)
         place_of_birth = place_of_birth_raw.strip() if place_of_birth_raw else None
         is_dead = deathday_raw is not None and deathday_raw != ''
-        
-        # Nome em negrito
+             
+             
         name_part = "[B]%s[/B]" % actor_name
         
-        # ============================================================
-        # PESSOA FALECIDA
-        # ============================================================
         if is_dead:
             if age is not None and deathday_formatted and birthday_formatted and place_of_birth:
-                bio = "%s faleceu em %s aos %d anos, nasceu em %s em %s." % (name_part, deathday_formatted, age, birthday_formatted, place_of_birth)
+                return "%s (%s – %s), natural de %s, faleceu aos %d anos de idade." % (name_part, birthday_formatted, deathday_formatted, place_of_birth, age)
             elif age is not None and deathday_formatted and birthday_formatted:
-                bio = "%s faleceu em %s aos %d anos, nasceu em %s." % (name_part, deathday_formatted, age, birthday_formatted)
-            elif age is not None and deathday_formatted and place_of_birth:
-                bio = "%s faleceu em %s aos %d anos, nasceu em %s." % (name_part, deathday_formatted, age, place_of_birth)
+                return "%s (%s – %s), faleceu aos %d anos de idade." % (name_part, birthday_formatted, deathday_formatted, age)
             elif age is not None and deathday_formatted:
-                bio = "%s faleceu em %s aos %d anos." % (name_part, deathday_formatted, age)
-            elif deathday_formatted and birthday_formatted and place_of_birth:
-                bio = "%s faleceu em %s, nasceu em %s em %s." % (name_part, deathday_formatted, birthday_formatted, place_of_birth)
-            elif deathday_formatted and birthday_formatted:
-                bio = "%s faleceu em %s, nasceu em %s." % (name_part, deathday_formatted, birthday_formatted)
-            elif deathday_formatted and place_of_birth:
-                bio = "%s faleceu em %s, nasceu em %s." % (name_part, deathday_formatted, place_of_birth)
+                return "%s faleceu em %s aos %d anos." % (name_part, deathday_formatted, age)
             elif deathday_formatted:
-                bio = "%s faleceu em %s." % (name_part, deathday_formatted)
-            elif age is not None and place_of_birth:
-                bio = "%s tinha %d anos quando faleceu, nasceu em %s." % (name_part, age, place_of_birth)
+                return "%s faleceu em %s." % (name_part, deathday_formatted)
             elif age is not None:
-                bio = "%s tinha %d anos quando faleceu." % (name_part, age)
-            else:
-                return None
-        
-        # ============================================================
-        # PESSOA VIVA
-        # ============================================================
+                return "%s tinha %d anos quando faleceu." % (name_part, age)
+            return None
         else:
             if age is not None and birthday_formatted and place_of_birth:
-                bio = "%s possui %d anos, nasceu em %s em %s." % (name_part, age, birthday_formatted, place_of_birth)
+                return "%s possui %d anos, nasceu em %s, em %s." % (name_part, age, birthday_formatted, place_of_birth)
             elif age is not None and birthday_formatted:
-                bio = "%s possui %d anos, nasceu em %s." % (name_part, age, birthday_formatted)
-            elif age is not None and place_of_birth:
-                bio = "%s possui %d anos, nasceu em %s." % (name_part, age, place_of_birth)
+                return "%s possui %d anos, nasceu em %s." % (name_part, age, birthday_formatted)
             elif age is not None:
-                bio = "%s possui %d anos." % (name_part, age)
+                return "%s possui %d anos." % (name_part, age)
             elif birthday_formatted and place_of_birth:
-                bio = "%s nasceu em %s em %s." % (name_part, birthday_formatted, place_of_birth)
-            elif birthday_formatted:
-                bio = "%s nasceu em %s." % (name_part, birthday_formatted)
+                return "%s nasceu em %s em %s." % (name_part, birthday_formatted, place_of_birth)
             elif place_of_birth:
-                bio = "%s nasceu em %s." % (name_part, place_of_birth)
-            else:
-                return None  # Sem dados suficientes
-        
-        return bio   
-    
+                return "%s nasceu em %s." % (name_part, place_of_birth)
+            return None
+
     def _get_movie_cast_from_tmdb(self, tmdb_id, media_type):
-        """
-        Obtém o cast do filme/série do TMDB.
-        Retorna lista de dicionários com 'name' e 'id'.
-        """
         try:
             from resources.lib.tmdb import tmdb_query
-            
-            if media_type == 'tv':
-                action = 'tv'
-            else:
-                action = 'movie'
-            
+            action = 'tv' if media_type == 'tv' else 'movie'
             details = tmdb_query(
                 action=action,
                 call=str(tmdb_id),
@@ -246,262 +355,116 @@ class CastPreloader(xbmc.Monitor):
             if not details:
                 return []
             
-            credits = details.get('credits', {})
-            cast = credits.get('cast', [])
-            
-            # Retornar os primeiros 10 atores principais
-            result = []
-            for actor in cast[:10]:
-                result.append({
-                    'name': actor.get('name', ''),
-                    'id': actor.get('id'),
-                    'character': actor.get('character', '')
-                })
-            
-            return result
-            
-        except Exception as e:
-            xbmc.log('[%s] Error getting cast from TMDB: %s' % (ADDON_ID, e), xbmc.LOGWARNING)
+            cast = details.get('credits', {}).get('cast', [])
+            return [{'name': a.get('name', ''), 'id': a.get('id'), 'character': a.get('character', ''), 'profile_path': a.get('profile_path', '')} for a in cast[:10]]
+        except:
             return []
 
     def _generate_cast_bios_text(self, tmdb_id, media_type, max_actors=10):
-        """
-        Gera o texto completo com as biografias de todos os atores.
-        Retorna string formatada com todas as bios separadas por quebra de linha dupla.
-        """
         if not tmdb_id:
             return ""
         
-        cast = self._get_movie_cast_from_tmdb(tmdb_id, media_type)
+        cache_key = 'bios_text_%s_%s' % (media_type, tmdb_id)
         
+        # Cache memória
+        with _generated_bios_lock:
+            if cache_key in _generated_bios_text_cache:
+                cached = _generated_bios_text_cache[cache_key]
+                if time.time() - cached['ts'] < BIOS_CACHE_MAX_AGE:
+                    return cached['text']
+        
+        cast = self._get_movie_cast_from_tmdb(tmdb_id, media_type)
         if not cast:
             return ""
         
         bios = []
-        
         for actor in cast[:max_actors]:
             if not actor.get('id'):
                 continue
-            
-            person_details = self._get_person_details(actor['id'])
+            person_details, _ = self._get_person_details_cached(actor['id'])
             if person_details:
                 bio = self._format_actor_bio(actor['name'], person_details)
                 if bio:
                     bios.append(bio)
         
-        # Juntar todas as bios com quebra de linha dupla
-        return "[CR][CR]".join(bios)
+        result_text = "[CR][CR]".join(bios)
+        
+        if result_text:
+            with _generated_bios_lock:
+                _generated_bios_text_cache[cache_key] = {'text': result_text, 'ts': time.time()}
+            try:
+                self.cache_manager.set(cache_key, result_text)
+            except:
+                pass
+        
+        return result_text
 
-    def _update_cast_bios_property(self, tmdb_id, media_type):
-        """
-        Atualiza a property Window(Home).Property(ds_cast_bios) com as biografias.
-        """
+    def _update_cast_bios_property(self, tmdb_id, media_type, window_id=10000):
         if self._bios_updating:
             return
         
         self._bios_updating = True
         
         try:
-            win = xbmcgui.Window(10000)  # Home window
+            win = xbmcgui.Window(window_id)
             
-            # Verificar se está em playback de vídeo
-            if not xbmc.Player().isPlayingVideo():
+            if not xbmc.Player().isPlayingVideo() and window_id == 10000:
                 win.clearProperty('ds_cast_bios')
                 return
             
-            # Verificar se já atualizamos para este item
             current_id = '%s_%s' % (media_type, tmdb_id)
             if current_id == self._last_bios_update_id:
                 return
             
             self._last_bios_update_id = current_id
-            
-            # Gerar texto das biografias
-            xbmc.log('[%s] 🎭 Generating cast bios for: %s' % (ADDON_ID, current_id), xbmc.LOGINFO)
             bios_text = self._generate_cast_bios_text(tmdb_id, media_type, max_actors=10)
             
             if bios_text:
                 win.setProperty('ds_cast_bios', bios_text)
-                xbmc.log('[%s] ✓ Cast bios updated (%d chars)' % (ADDON_ID, len(bios_text)), xbmc.LOGINFO)
             else:
                 win.clearProperty('ds_cast_bios')
-                xbmc.log('[%s] ✗ No cast bios available' % ADDON_ID, xbmc.LOGDEBUG)
-                
-        except Exception as e:
-            xbmc.log('[%s] Error updating cast bios: %s' % (ADDON_ID, e), xbmc.LOGWARNING)
+        except:
+            pass
         finally:
             self._bios_updating = False
 
     def _clear_cast_bios_property(self):
-        """Limpa a property de biografias."""
         try:
-            win = xbmcgui.Window(10000)
-            win.clearProperty('ds_cast_bios')
+            xbmcgui.Window(10000).clearProperty('ds_cast_bios')
             self._last_bios_update_id = None
         except:
             pass
 
     # ============================================================
-    # Detecta eventos do Kodi instantaneamente
+    # Eventos do Kodi
     # ============================================================
     def onNotification(self, sender, method, data):
-        """
-        Callback chamado INSTANTANEAMENTE quando eventos ocorrem no Kodi.
-        Isso elimina o delay de até 2s do polling.
-        """
         try:
-            if method in ['Player.OnStop']:
-                xbmc.log('[%s] ⚡ Instant event: %s' % (ADDON_ID, method), xbmc.LOGINFO)
-                self._trigger_instant_preload()
-                # Limpa biografias quando para
+            if method == 'Player.OnStop':
                 self._clear_cast_bios_property()
-            
-            elif method in ['Player.OnPause', 'Player.OnAVChange']:
-                xbmc.log('[%s] ⚡ Instant event: %s' % (ADDON_ID, method), xbmc.LOGINFO)
-                self._trigger_instant_preload()
-            
-            elif method == 'GUI.OnScreensaverDeactivated':
-                self._trigger_instant_preload()
-            
             elif method == 'Player.OnPlay':
-                # Quando inicia playback, prepara TUDO em background
-                xbmc.log('[%s] ⚡ Player.OnPlay - Preparing ALL data (cast + metadata + bios)' % ADDON_ID, xbmc.LOGINFO)
-                self._last_bios_update_id = None  # Reset para forçar nova busca
-                
-        except Exception as e:
-            xbmc.log('[%s] onNotification error: %s' % (ADDON_ID, str(e)), xbmc.LOGDEBUG)
-    
-    def _trigger_instant_preload(self):
-        """
-        Dispara preload instantâneo e força intervalo rápido por 3 segundos.
-        """
-        self._force_fast_interval = True
-        self._fast_interval_until = time.time() + 3.0
-        
-        if self._playing_item_cache:
-            xbmc.log('[%s] ⚡ Instant preload triggered for: %s' % 
-                     (ADDON_ID, self._playing_item_cache), xbmc.LOGINFO)
-            
-            Thread(target=self.preload_cast, args=(
-                self._playing_item_cache.get('tmdb_id'),
-                self._playing_item_cache.get('media_type', 'movie'),
-                self._playing_item_cache.get('imdb_id'),
-                True
-            )).start()
+                self._last_bios_update_id = None
+        except:
+            pass
 
     def _get_adaptive_interval(self):
-        """
-        Retorna o intervalo baseado no contexto atual.
-        """
-        if self._force_fast_interval:
-            if time.time() < self._fast_interval_until:
-                return self.INTERVAL_FAST, 'forced_fast'
-            else:
-                self._force_fast_interval = False
-        
         is_playing = xbmc.getCondVisibility('Player.HasVideo')
         is_fullscreen = xbmc.getCondVisibility('Window.IsActive(fullscreenvideo)')
         is_home = xbmc.getCondVisibility('Window.IsActive(home)')
         is_videoinfo = xbmc.getCondVisibility('Window.IsActive(movieinformation)')
         
-        current_context = 'unknown'
-        
         if is_videoinfo:
-            current_context = 'videoinfo'
-            interval = self.INTERVAL_FAST
-            
+            return self.INTERVAL_FAST, 'videoinfo'
         elif is_home and not is_playing:
-            current_context = 'home_active'
-            interval = self.INTERVAL_FAST
-            
-        elif is_home and is_playing:
-            current_context = 'home_background'
-            interval = self.INTERVAL_NORMAL
-            
+            return self.INTERVAL_FAST, 'home_active'
         elif is_fullscreen:
-            current_context = 'fullscreen'
-            interval = self.INTERVAL_SLOW
-            
+            return self.INTERVAL_SLOW, 'fullscreen'
         elif is_playing:
-            current_context = 'playing_osd'
-            interval = self.INTERVAL_NORMAL
-            
+            return self.INTERVAL_NORMAL, 'playing'
         else:
-            current_context = 'idle'
-            interval = self.INTERVAL_IDLE
-        
-        if current_context != self._last_context:
-            xbmc.log('[%s] 🔄 Context: %s → %s (interval: %.1fs)' % 
-                     (ADDON_ID, self._last_context, current_context, interval), xbmc.LOGINFO)
-            
-            if self._last_context == 'fullscreen' and current_context != 'fullscreen':
-                self._trigger_instant_preload()
-            
-            self._last_context = current_context
-        
-        return interval, current_context
-
-    def preload_cast(self, tmdb_id, media_type, imdb_id=None, priority=False):
-        """Pré-carrega o cast em background"""
-        
-        if not priority:
-            with self.lock:
-                if self.processing:
-                    return
-                self.processing = True
-        
-        try:
-            from resources.lib.tmdb import tmdb_query, tmdb_find
-            
-            start_time = time.time()
-            
-            if (not tmdb_id or tmdb_id in ['None', '']) and imdb_id:
-                cached_tmdb_id, cached_media_type = self.cache_manager.get_tmdb_from_imdb(imdb_id)
-                
-                if cached_tmdb_id:
-                    tmdb_id = cached_tmdb_id
-                    if cached_media_type:
-                        media_type = cached_media_type
-                else:
-                    try:
-                        find_data = tmdb_query(
-                            action='find', 
-                            call=imdb_id, 
-                            params={'external_source': 'imdb_id'}, 
-                            show_error=False
-                        )
-                        results_key = 'movie_results' if media_type == 'movie' else 'tv_results'
-                        if find_data and results_key in find_data and len(find_data[results_key]) > 0:
-                            tmdb_id = find_data[results_key][0]['id']
-                            self.cache_manager.set_imdb_tmdb_map(imdb_id, tmdb_id, media_type)
-                    except Exception as e:
-                        xbmc.log('[%s] ✗ IMDB→TMDB error: %s' % (ADDON_ID, str(e)), xbmc.LOGERROR)
-
-            if not tmdb_id or tmdb_id == 'None':
-                return
-
-            cache_key = 'cast_%s_%s' % (media_type, tmdb_id)
-            
-            if cache_key in CastPreloader._cast_cache_memory:
-                return CastPreloader._cast_cache_memory[cache_key]
-
-            cast_data = self.async_loader.get_cast_from_cache_or_load(tmdb_id, media_type, self.cache_manager)
-            
-            if cast_data:
-                CastPreloader._cast_cache_memory[cache_key] = cast_data
-                xbmc.log('[%s] ��� Cached: %s (%.2fs)' % 
-                         (ADDON_ID, cache_key, time.time() - start_time), xbmc.LOGINFO)
-
-        except Exception as e:
-            xbmc.log('[%s] ✗ Preload ERROR: %s' % (ADDON_ID, str(e)), xbmc.LOGERROR)
-
-        finally:
-            if not priority:
-                with self.lock:
-                    self.processing = False
+            return self.INTERVAL_IDLE, 'idle'
 
     def check_focused_item(self):
-        """Verifica o item atualmente focado"""
         try:
             tmdb_id = xbmc.getInfoLabel('Window(Home).Property(ds_tmdb_id)')
             imdb_id = xbmc.getInfoLabel('Window(Home).Property(ds_imdb_id)')
@@ -514,70 +477,44 @@ class CastPreloader(xbmc.Monitor):
                 media_type = 'tv'
             
             if not tmdb_id and not imdb_id:
-                imdb_id = xbmc.getInfoLabel('Window(Home).Property(ContextMenuTargetID)')
-                dbtype = xbmc.getInfoLabel('Window(Home).Property(ContextMenuTargetDBType)')
-                
-                if dbtype == 'movie':
-                    media_type = 'movie'
-                elif dbtype in ['tvshow', 'season', 'episode']:
-                    media_type = 'tv'
-            
-            if not tmdb_id and not imdb_id:
                 return
-            
             if not media_type:
                 return
 
-            item_id = '%s_%s_%s' % (media_type, tmdb_id if tmdb_id else '', imdb_id if imdb_id else '')
+            item_id = '%s_%s_%s' % (media_type, tmdb_id or '', imdb_id or '')
 
             if item_id != self.current_item:
                 self.current_item = item_id
-                self._last_activity_time = time.time()
                 
-                def _background_worker(t_id, m_type, i_id):
+                def _worker(t_id, m_type, i_id):
                     self.preload_cast(t_id, m_type, i_id)
                     self.fetch_and_set_metadata(t_id, i_id, m_type)
+                    self.populate_cast_properties(t_id, m_type, i_id)  # ← ADICIONADO
 
-                Thread(target=_background_worker, args=(tmdb_id, media_type, imdb_id)).start()
+                Thread(target=_worker, args=(tmdb_id, media_type, imdb_id)).start()
+        except:
+            pass
 
-        except Exception as e:
-            xbmc.log('[%s] Check error: %s' % (ADDON_ID, str(e)), xbmc.LOGDEBUG)
-
-    def fetch_and_set_metadata(self, tmdb_id, imdb_id, media_type):
-        """Busca metadata e define via SetProperty - DIFERENCIA FILME DE SÉRIE"""
+    def fetch_and_set_metadata(self, tmdb_id, imdb_id, media_type, window_id=10000):
         try:
-            # 1. Verifica Cache Primeiro (Meta Cache)
             meta_cache_key = 'meta_%s_%s' % (media_type, tmdb_id)
             cached_meta = self.cache_manager.get(meta_cache_key)
             
             if cached_meta:
-                xbmc.log('[%s] ✓ Metadata cache HIT: %s' % (ADDON_ID, meta_cache_key), xbmc.LOGDEBUG)
                 for key, value in cached_meta.items():
                     if value:
-                        xbmc.executebuiltin('SetProperty(%s,"%s",home)' % (key, value))
+                        xbmc.executebuiltin('SetProperty(%s,"%s",%d)' % (key, value, window_id))
                     else:
-                        xbmc.executebuiltin('ClearProperty(%s,home)' % key)
+                        xbmc.executebuiltin('ClearProperty(%s,%d)' % (key, window_id))
                 return
 
-            # 2. Cache MISS - Busca da API
-            xbmc.log('[%s] ✗ Metadata cache MISS: %s - Fetching...' % (ADDON_ID, meta_cache_key), xbmc.LOGDEBUG)
-            
+            # Imports tardios - só carrega quando precisa
             from resources.lib.tmdb import tmdb_query, tmdb_get_cert, format_currency
             from resources.lib.omdb import omdb_api
             
-            meta_dict = {
-                'budget': '',
-                'revenue': '',
-                'mpaa': '',
-                'studio': '',
-                'country': '',
-                'awards': ''
-            }
+            meta_dict = {'budget': '', 'revenue': '', 'mpaa': '', 'studio': '', 'country': '', 'awards': '', 'imdb_combined': ''}
             
             if tmdb_id:
-                # ============================================================
-                # SÉRIE: Usa endpoint 'tv' e content_ratings
-                # ============================================================
                 if media_type == 'tv':
                     tv_data = tmdb_query(
                         action='tv',
@@ -586,42 +523,27 @@ class CastPreloader(xbmc.Monitor):
                         show_error=False
                     )
                     
+                    # FALLBACK: Se falhar e tiver IMDB, tenta achar o ID correto
+                    if not tv_data and imdb_id:
+                        new_tmdb_id, _ = self._resolve_tmdb_id(imdb_id, 'tv')
+                        if new_tmdb_id and str(new_tmdb_id) != str(tmdb_id):
+                            tv_data = tmdb_query(
+                                action='tv',
+                                call=str(new_tmdb_id),
+                                params={'append_to_response': 'content_ratings,external_ids'},
+                                show_error=False
+                            )
+
                     if tv_data:
-                        # Séries NÃO têm budget/revenue
-                        meta_dict['budget'] = ''
-                        meta_dict['revenue'] = ''
-                        
-                        # MPAA para séries usa content_ratings
                         meta_dict['mpaa'] = tmdb_get_cert(tv_data) or ''
-                        
-                        # Séries usam 'networks' como studio principal
                         networks = tv_data.get('networks', [])
                         if networks:
-                            network_str = ', '.join([n['name'] for n in networks])
-                            meta_dict['studio'] = network_str.replace('"', "'")
-                        else:
-                            studios = tv_data.get('production_companies', [])
-                            if studios:
-                                studio_str = ', '.join([s['name'] for s in studios])
-                                meta_dict['studio'] = studio_str.replace('"', "'")
-                        
-                        # Countries (origin_country para séries)
+                            meta_dict['studio'] = ', '.join([n['name'] for n in networks]).replace('"', "'")
                         countries = tv_data.get('origin_country', [])
                         if countries:
                             meta_dict['country'] = ', '.join(countries)
-                        else:
-                            prod_countries = tv_data.get('production_countries', [])
-                            if prod_countries:
-                                country_str = ', '.join([c['name'] for c in prod_countries])
-                                meta_dict['country'] = country_str.replace('"', "'")
-                        
-                        # Atualiza IMDB ID se não tiver
                         if not imdb_id:
                             imdb_id = tv_data.get('external_ids', {}).get('imdb_id')
-                
-                # ============================================================
-                # FILME: Usa endpoint 'movie' e release_dates
-                # ============================================================
                 else:
                     movie_data = tmdb_query(
                         action='movie',
@@ -629,111 +551,117 @@ class CastPreloader(xbmc.Monitor):
                         params={'append_to_response': 'release_dates'},
                         show_error=False
                     )
-                            
+
+                    # FALLBACK: Se falhar e tiver IMDB, tenta achar o ID correto
+                    if not movie_data and imdb_id:
+                        new_tmdb_id, _ = self._resolve_tmdb_id(imdb_id, 'movie')
+                        if new_tmdb_id and str(new_tmdb_id) != str(tmdb_id):
+                            movie_data = tmdb_query(
+                                action='movie',
+                                call=str(new_tmdb_id),
+                                params={'append_to_response': 'release_dates'},
+                                show_error=False
+                            )
+
                     if movie_data:
-                        budget_val = format_currency(movie_data.get('budget'))
-                        revenue_val = format_currency(movie_data.get('revenue'))
-                        
-                        meta_dict['budget'] = budget_val if budget_val else ''
-                        meta_dict['revenue'] = revenue_val if revenue_val else ''
+                        meta_dict['budget'] = format_currency(movie_data.get('budget')) or ''
+                        meta_dict['revenue'] = format_currency(movie_data.get('revenue')) or ''
                         meta_dict['mpaa'] = tmdb_get_cert(movie_data) or ''
-                        
-                        # Studios (production_companies para filmes)
                         studios = movie_data.get('production_companies', [])
                         if studios:
-                            studio_str = ', '.join([s['name'] for s in studios])
-                            meta_dict['studio'] = studio_str.replace('"', "'")
-
-                        # Countries
+                            meta_dict['studio'] = ', '.join([s['name'] for s in studios]).replace('"', "'")
                         countries = movie_data.get('production_countries', [])
                         if countries:
-                            country_str = ', '.join([c['name'] for c in countries])
-                            meta_dict['country'] = country_str.replace('"', "'")
-                        
-                        # Atualiza IMDB ID se não tiver
+                            meta_dict['country'] = ', '.join([c['name'] for c in countries]).replace('"', "'")
+                            # 
+                        else:
+                            # 
+                            pass
+
                         if not imdb_id:
                             imdb_id = movie_data.get('imdb_id')
 
-            # ============================================================
-            # AWARDS: Funciona igual para filme e série (usa IMDB ID)
-            # ============================================================
             if imdb_id:
                 try:
                     omdb_data = omdb_api(imdb_id)
-                    if omdb_data and omdb_data.get('awards'):
-                        meta_dict['awards'] = omdb_data['awards'].replace('"', "'")
+                    if omdb_data:
+                        if omdb_data.get('awards'):
+                            meta_dict['awards'] = omdb_data['awards'].replace('"', "'")
+                        
+                        # Extrai Rating e Votes
+                        rating = omdb_data.get('imdbRating', 'N/A')
+                        votes = omdb_data.get('imdbVotes', '0').replace(',', '').replace('.', '')
+                        
+                        if rating and rating != 'N/A':
+                             try:
+                                 votes_int = int(votes)
+                                 votes_formatted = "{:,}".format(votes_int).replace(",", ".")
+                             except:
+                                 votes_formatted = votes
+                                 
+                             meta_dict['imdb_combined'] = '%s (%s votos)' % (rating, votes_formatted)
                 except:
                     pass
             
-            # 3. Salva no Cache
             self.cache_manager.set(meta_cache_key, meta_dict)
-            xbmc.log('[%s] 💾 Metadata cached: %s' % (ADDON_ID, meta_cache_key), xbmc.LOGINFO)
             
-            # 4. Aplica Propriedades
             for key, value in meta_dict.items():
                 if value:
-                    xbmc.executebuiltin('SetProperty(%s,"%s",home)' % (key, value))
+                    xbmc.executebuiltin('SetProperty(%s,"%s",%d)' % (key, value, window_id))
                 else:
-                    xbmc.executebuiltin('ClearProperty(%s,home)' % key)
-
-        except Exception as e:
-            xbmc.log('[%s] Metadata Fetch Error: %s' % (ADDON_ID, str(e)), xbmc.LOGWARNING)
+                    xbmc.executebuiltin('ClearProperty(%s,%d)' % (key, window_id))
+        except:
+            pass
 
     def run(self):
-        """Loop principal do serviço"""
-        
         last_infoid = None
-        last_playerid = None
         last_preloaded_playing = None
 
-        xbmc.log('[%s] 🚀 Adaptive loop started (with instant transitions + cast bios + preload ALL on play)' % ADDON_ID, xbmc.LOGINFO)
+        # WARM-UP completo: Service + Plugin
+        Thread(target=self._warmup_cache_on_startup, daemon=True).start()
+        Thread(target=self._warmup_plugin_on_startup, daemon=True).start()
+        
+        xbmc.log('[%s] Service started' % ADDON_ID, xbmc.LOGINFO)
 
         while not self.abortRequested():
-            interval, context = self._get_adaptive_interval()
+            interval, _ = self._get_adaptive_interval()
             
             if self.waitForAbort(interval):
                 break
              
             is_playing = xbmc.getCondVisibility('Player.HasVideo')
             
-            # ============================================================
-            # PR��-CARREGA TUDO ASSIM QUE O VÍDEO COMEÇA
-            # Cast + Metadata + Biografias - tudo em background
-            # ============================================================
+            # Playing item
             if is_playing:
                 try:
-                    p_tmdb = xbmc.getInfoLabel('VideoPlayer.UniqueID(tmdb)')
-                    if not p_tmdb:
-                        p_tmdb = xbmc.getInfoLabel('VideoPlayer.UniqueID')
+                    p_tmdb = xbmc.getInfoLabel('VideoPlayer.UniqueID(tmdb)') or xbmc.getInfoLabel('VideoPlayer.UniqueID')
                     p_imdb = xbmc.getInfoLabel('VideoPlayer.IMDBNumber')
+                    p_media_type = 'tv' if xbmc.getCondVisibility('VideoPlayer.Content(episodes)') else 'movie'
                     
-                    p_media_type = 'movie'
-                    if xbmc.getCondVisibility('VideoPlayer.Content(episodes)'):
-                        p_media_type = 'tv'
-                    
-                    # SEMPRE atualiza o cache do item em reprodução
                     if p_tmdb or p_imdb:
-                        self._playing_item_cache = {
-                            'tmdb_id': p_tmdb,
-                            'imdb_id': p_imdb,
-                            'media_type': p_media_type
-                        }
+                        self._playing_item_cache = {'tmdb_id': p_tmdb, 'imdb_id': p_imdb, 'media_type': p_media_type}
                     
                     current_playing_id = '%s_%s_%s' % (p_media_type, p_tmdb or '', p_imdb or '')
                     
                     if current_playing_id != last_preloaded_playing and (p_tmdb or p_imdb):
+                        # 
                         last_preloaded_playing = current_playing_id
                         
-                        xbmc.log('[%s] 🎬 Preloading ALL data for playing item: %s' % 
-                                 (ADDON_ID, current_playing_id), xbmc.LOGINFO)
-                        
-                        # PRÉ-CARREGA TUDO EM BACKGROUND (Cast + Metadata + Bios)
-                        def _preload_all_playing_data(t_id, i_id, m_type):
-                            self.preload_cast(t_id, m_type, i_id)
-                            self.fetch_and_set_metadata(t_id, i_id, m_type)
-                            self._update_cast_bios_property(t_id, m_type)
-                        
-                        Thread(target=_preload_all_playing_data, args=(p_tmdb, p_imdb, p_media_type)).start()
+                        # OTIMIZAÇÃO: Se for o mesmo item focado antes, reutiliza cache INSTANTANEAMENTE
+                        if self.current_item == current_playing_id:
+                             # 
+                             self.preload_cast(p_tmdb, p_media_type, p_imdb)
+                             self.fetch_and_set_metadata(p_tmdb, p_imdb, p_media_type, window_id=12005)
+                             self.populate_cast_properties(p_tmdb, p_media_type, p_imdb, window_id=12005)
+                             self._update_cast_bios_property(p_tmdb, p_media_type, window_id=12005)
+                        else:
+                            def _play_worker(t, i, m):
+                                self.preload_cast(t, m, i)
+                                self.fetch_and_set_metadata(t, i, m, window_id=12005)
+                                self.populate_cast_properties(t, m, i, window_id=12005)
+                                self._update_cast_bios_property(t, m, window_id=12005)
+                            
+                            Thread(target=_play_worker, args=(p_tmdb, p_imdb, p_media_type)).start()
                 except:
                     pass
              
@@ -743,66 +671,54 @@ class CastPreloader(xbmc.Monitor):
                     tmdb_id = xbmc.getInfoLabel('ListItem.UniqueID(tmdb)')
                     imdb_id = xbmc.getInfoLabel('ListItem.IMDBNumber')
                     dbtype = xbmc.getInfoLabel('ListItem.DBType')
-                    
-                    # Detecta tipo de mídia
-                    if dbtype in ['movie']:
-                        info_media_type = 'movie'
-                    elif dbtype in ['tvshow', 'season', 'episode']:
-                        info_media_type = 'tv'
-                    else:
-                        # Fallback: tenta detectar pela janela
-                        info_media_type = 'movie'
+                    info_media_type = 'tv' if dbtype in ['tvshow', 'season', 'episode'] else 'movie'
                     
                     current_infoid = '%s_%s_%s' % (info_media_type, tmdb_id, imdb_id)
                     
                     if current_infoid != last_infoid and (tmdb_id or imdb_id):
                         last_infoid = current_infoid
                         
-                        def _info_worker(t_id, i_id, m_type):
-                            self.preload_cast(t_id, m_type, i_id)
-                            self.fetch_and_set_metadata(t_id, i_id, m_type)
+                        def _info_worker(t, i, m):
+                            self.preload_cast(t, m, i)
+                            self.fetch_and_set_metadata(t, i, m)
+                            self.populate_cast_properties(t, m, i)  # ← ADICIONADO
                         
                         Thread(target=_info_worker, args=(tmdb_id, imdb_id, info_media_type)).start()
-                except: pass
+                except: 
+                    pass
+            else:
+                last_infoid = None
 
-            # ============================================================
-            # OSD/SeekBar - FALLBACK (dados já devem estar prontos)
-            # ============================================================
+            # OSD Fallback
             if is_playing and (xbmc.getCondVisibility('Window.IsActive(videoosd)') or 
-                               xbmc.getCondVisibility('Window.IsActive(seekbardialog)') or
                                xbmc.getCondVisibility('Player.ShowInfo') or
                                xbmc.getCondVisibility('Window.IsActive(fullscreeninfo)')):
                 try:
-                    p_tmdb = xbmc.getInfoLabel('VideoPlayer.UniqueID(tmdb)')
-                    if not p_tmdb:
-                        p_tmdb = xbmc.getInfoLabel('VideoPlayer.UniqueID')
+                    p_tmdb = xbmc.getInfoLabel('VideoPlayer.UniqueID(tmdb)') or xbmc.getInfoLabel('VideoPlayer.UniqueID')
                     p_imdb = xbmc.getInfoLabel('VideoPlayer.IMDBNumber')
+                    p_media_type = 'tv' if xbmc.getCondVisibility('VideoPlayer.Content(episodes)') else 'movie'
                     
-                    p_media_type = 'movie'
-                    if xbmc.getCondVisibility('VideoPlayer.Content(episodes)'):
-                        p_media_type = 'tv'
-                    
-                    # FALLBACK: Se por algum motivo não tiver dados, busca agora
                     win = xbmcgui.Window(10000)
                     
+                    # Fallback Bios
                     if not win.getProperty('ds_cast_bios') and p_tmdb:
-                        xbmc.log('[%s] ⚠️ OSD opened but bios missing - fetching now' % ADDON_ID, xbmc.LOGWARNING)
-                        Thread(target=self._update_cast_bios_property, args=(p_tmdb, p_media_type)).start()
-                    
-                    if not win.getProperty('budget') and not win.getProperty('mpaa') and p_tmdb:
-                        xbmc.log('[%s] ⚠️ OSD opened but metadata missing - fetching now' % ADDON_ID, xbmc.LOGWARNING)
-                        Thread(target=self.fetch_and_set_metadata, args=(p_tmdb, p_imdb, p_media_type)).start()
-                            
+                        Thread(target=self._update_cast_bios_property, args=(p_tmdb, p_media_type, 12005)).start()
+                        
+                    # Fallback Metadata (incluindo Country)
+                    if not win.getProperty('country') and p_tmdb:
+                         # 
+                         Thread(target=self.fetch_and_set_metadata, args=(p_tmdb, p_imdb, p_media_type, 12005)).start()
+
                 except: 
                     pass
 
             self.check_focused_item()
-              
-        xbmc.log('[%s] Shutting down service...' % ADDON_ID, xbmc.LOGINFO)
+        
+        # Shutdown
         self._clear_cast_bios_property()
         self.cache_manager.shutdown()
         self.async_loader.shutdown()
-        xbmc.log('[%s] Cast Preloader Service Stopped' % ADDON_ID, xbmc.LOGINFO)
+        xbmc.log('[%s] Service Stopped' % ADDON_ID, xbmc.LOGINFO)
 
 if __name__ == '__main__':
     monitor = CastPreloader()

@@ -16,7 +16,7 @@ FILTER_MOVIES = ADDON.getSettingBool('filter_movies')
 FILTER_SHOWS = ADDON.getSettingBool('filter_shows')
 FILTER_SHOWS_BLACKLIST = [10763, 10764, 10767]
 FILTER_UPCOMING = ADDON.getSettingBool('filter_upcoming')
-FILTER_DAYDELTA = int(ADDON.getSetting('filter_daydelta'))
+FILTER_DAYDELTA = ADDON.getSettingInt('filter_daydelta')
 
 ########################
 

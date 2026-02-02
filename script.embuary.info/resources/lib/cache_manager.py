@@ -316,6 +316,41 @@ class CastCacheManager:
         
         xbmc.log('[script.embuary.info] Cache manager shutdown complete', xbmc.LOGINFO)
 
+    def get_recent_items(self, prefix, limit=50):
+        """
+        Retorna os items mais recentes do cache que começam com o prefixo.
+        Usado para warm-up na inicialização.
+        """
+        result = {}
+        
+        try:
+            with self.db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    SELECT cache_key, data FROM cast_cache 
+                    WHERE cache_key LIKE ? 
+                    ORDER BY timestamp DESC 
+                    LIMIT ?
+                ''', (prefix + '%', limit))
+                
+                rows = cursor.fetchall()
+                conn.close()
+                
+                for row in rows:
+                    cache_key = row[0]
+                    try:
+                        data = json.loads(row[1])
+                        result[cache_key] = data
+                    except:
+                        pass
+                        
+        except Exception as e:
+            xbmc.log('[script.embuary.info] get_recent_items error: %s' % e, xbmc.LOGDEBUG)
+        
+        return result    
+
 ########################
 
 # Instância global (singleton)

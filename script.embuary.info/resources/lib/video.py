@@ -15,7 +15,7 @@ from resources.lib.tmdb import *
 
 SIMILAR_FILTER = ADDON.getSettingBool('similar_movies_filter')
 FILTER_UPCOMING = ADDON.getSettingBool('filter_upcoming')
-FILTER_DAYDELTA = int(ADDON.getSetting('filter_daydelta'))
+FILTER_DAYDELTA = ADDON.getSettingInt('filter_daydelta')
 
 ########################
 

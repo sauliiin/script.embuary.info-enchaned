@@ -8,7 +8,6 @@ import xbmcgui
 import xbmcvfs 
 import requests
 import datetime
-import urllib.request as urllib
 from urllib.parse import urlencode
 import os
 import json
@@ -21,24 +20,35 @@ from resources.lib.localdb import *
 
 ########################
 '''
-Poster	w92, w154, w185, w342, w500, w780, original
-Backdrop (Fundo)	w300, w780, w1280, original
-Profile (Atores)	w45, w185, h632, original
-Logo (Produtoras)	w45, w92, w154, w185, w300, w500, original
-Still (Frames de TV)	w92, w185, w300, original
+Poster (2:3)
+w92 (92px × 138px), w154 (154px × 231px), w185 (185px × 278px), w342 (342px × 513px), w500 (500px × 750px), w780 (780px × 1170px), original
+
+Backdrop/Fundo (16:9)
+w300 (300px × 169px), w780 (780px × 439px), w1280 (1280px × 720px), original
+
+Profile/Atores (2:3 vertical)
+w45 (45px × 68px), w185 (185px × 278px), h632 (421px × 632px), original
+
+Logo/Produtoras (varia)
+w45 (45px × variável), w92 (92px × variável), w154 (154px × variável), w185 (185px × variável), w300 (300px × variável), w500 (500px × variável), original
+
+Still/Frames de TV (16:9)
+w92 (92px × 52px), w185 (185px × 104px), w300 (300px × 169px), original
 '''
 
 API_KEY = ADDON.getSettingString('tmdb_api_key')
 API_URL = 'https://api.themoviedb.org/3/'
 
 TMDB_IMG_BASE = 'https://image.tmdb.org/t/p/'
-IMG_POSTER    = TMDB_IMG_BASE + 'w500'    
+IMG_POSTER    = TMDB_IMG_BASE + 'w780'    
 IMG_FANART    = TMDB_IMG_BASE + 'w1280'   
-IMG_PROFILE   = TMDB_IMG_BASE + 'w185'     
+IMG_PROFILE   = TMDB_IMG_BASE + 'h632'     
 IMG_STILL     = TMDB_IMG_BASE + 'w300'    
 IMG_ORIGINAL  = TMDB_IMG_BASE + 'original' 
 
-TRAKT_API_KEY = 'fbc2791a2609e77d4e9d1689b7332a7124428eb7d8ea46085876d8867755a357'
+# Preferência: usar a chave configurada nas settings (consistente com settings.xml).
+# Fallback: mantém a chave anterior caso a setting não exista/venha vazia.
+TRAKT_API_KEY = ADDON.getSettingString('trakt_api_key') or 'fbc2791a2609e77d4e9d1689b7332a7124428eb7d8ea46085876d8867755a357'
 
 CACHE_DIR = xbmcvfs.translatePath('special://profile/addon_data/script.embuary.info/')
 CACHE_FILE = os.path.join(CACHE_DIR, 'trakt_cache.json')
@@ -47,7 +57,6 @@ CACHE_MAX_AGE = 30 * 24 * 60 * 60  # 30 dias em segundos
 ########################
 
 session = requests.Session()
-_trakt_executor = ThreadPoolExecutor(max_workers=20)
 
 def tmdb_query(action,call=None,get=None,get2=None,get3=None,get4=None,params=None,use_language=True,language=DEFAULT_LANGUAGE,show_error=False):
     urlargs = {}
@@ -450,15 +459,22 @@ def tmdb_get_combined_reviews(item_id, media_type='movie', max_comments=20):
         'trakt-api-version': '2',
         'trakt-api-key': TRAKT_API_KEY
     }
-    params = {'limit': max_comments, 'sort': 'newest'}
+    params = {'limit': 200, 'sort': 'likes'}
 
     def fmt(c):
-        text = c.get('comment', '').replace('\n', ' ').strip()
+        comment_text = c.get('comment', '').replace('\n', ' ').strip()
+        is_spoiler = c.get('spoiler', False)
+        user_lang = c.get('user', {}).get('language', 'en')
+        
+        if is_spoiler or len(comment_text) > 600 or user_lang not in ('pt', 'en', 'es'):
+            return None
+
+        review_block = f"[B][COLOR FFE50914]ANÁLISE:[/COLOR][/B] {comment_text}"
         user_rating = c.get('user_rating')
-        parts = [text]
         if user_rating is not None:
-            parts.append(f"[B]Nota: {user_rating}/10[/B]")
-        return ' '.join(parts)
+             review_block += f"  [B]NOTA: {user_rating}/10[/B]"
+             
+        return review_block
 
     comments = []
     if str(item_id).isdigit():
@@ -467,7 +483,14 @@ def tmdb_get_combined_reviews(item_id, media_type='movie', max_comments=20):
             response = session.get(url, headers=headers, params=params, timeout=1)
             if response.status_code == 200:
                 data = response.json()
-                comments = [fmt(c) for c in data if c.get('comment', '').strip()][:max_comments]
+                # Apply filter and limit
+                valid_comments = []
+                for c in data:
+                    formatted = fmt(c)
+                    if formatted:
+                        valid_comments.append(formatted)
+                        if len(valid_comments) >= 20: break
+                comments = valid_comments
         except Exception as e:
             xbmc.log(f"[Trakt] Error getting reviews by TMDB id: {str(e)}", xbmc.LOGDEBUG)
 
@@ -479,7 +502,13 @@ def tmdb_get_combined_reviews(item_id, media_type='movie', max_comments=20):
                     response = session.get(url, headers=headers, params=params, timeout=1)
                     if response.status_code == 200:
                         data = response.json()
-                        comments = [fmt(c) for c in data if c.get('comment', '').strip()][:max_comments]
+                        valid_comments = []
+                        for c in data:
+                            formatted = fmt(c)
+                            if formatted:
+                                valid_comments.append(formatted)
+                                if len(valid_comments) >= 20: break
+                        comments = valid_comments
                 except Exception as e:
                     xbmc.log(f"[Trakt] Error getting reviews by slug: {str(e)}", xbmc.LOGDEBUG)
     else:
@@ -488,7 +517,13 @@ def tmdb_get_combined_reviews(item_id, media_type='movie', max_comments=20):
             response = session.get(url, headers=headers, params=params, timeout=1)
             if response.status_code == 200:
                 data = response.json()
-                comments = [fmt(c) for c in data if c.get('comment', '').strip()][:max_comments]
+                valid_comments = []
+                for c in data:
+                    formatted = fmt(c)
+                    if formatted:
+                        valid_comments.append(formatted)
+                        if len(valid_comments) >= 20: break
+                comments = valid_comments
         except Exception as e:
             xbmc.log(f"[Trakt] Error getting reviews by slug: {str(e)}", xbmc.LOGDEBUG)
 
@@ -819,6 +854,34 @@ def tmdb_get_cert(item):
     mpaa = ''
     mpaa_fallback = ''
 
+    # Mapeamento de Classificação para o Padrão Brasileiro
+    CERT_MAP_BR = {
+        # USA
+        'G': 'Livre',
+        'PG': '10 anos',
+        'PG-13': '12 anos',
+        'R': '16 anos',
+        'NC-17': '18 anos',
+        'NR': 'Livre',
+        'Unrated': 'Livre',
+        # Portugal e Europa
+        'M/3': 'Livre',
+        'M/4': 'Livre',
+        'M/6': 'Livre',
+        'M/12': '12 anos',
+        'M/14': '14 anos',
+        'M/16': '16 anos',
+        'M/18': '18 anos',
+        'Públicos': 'Livre',
+        # Numeric BR (Native)
+        '10': '10 anos',
+        '12': '12 anos',
+        '14': '14 anos',
+        '16': '16 anos',
+        '18': '18 anos',
+        'L': 'Livre'
+    }
+
     if item.get('content_ratings'):
         for cert in item['content_ratings']['results']:
             if cert['iso_3166_1'] == COUNTRY_CODE:
@@ -835,9 +898,16 @@ def tmdb_get_cert(item):
             elif cert['iso_3166_1'] == 'US':
                 mpaa_fallback = cert['release_dates'][0]['certification']
 
-    if mpaa:
-        return prefix + mpaa
-    return mpaa_fallback
+    final_cert = mpaa if mpaa else mpaa_fallback
+    
+    # Aplica Tradução (apenas se for código BR ou fallback)
+    # Se já vier "10", "12" etc do próprio TMDB BR, o mapa mantém (se não achar key, retorna default)
+    if final_cert:
+         final_cert = CERT_MAP_BR.get(final_cert, final_cert)
+
+    if final_cert:
+        return prefix + final_cert
+    return ''
 
 
 def omdb_properties(list_item,imdbnumber):
